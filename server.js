@@ -1,37 +1,69 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
+const axios = require('axios');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
-// CORS enable korchi jate jekono frontend theke request ashte pare
-app.use(cors()); 
+app.use(cors());
+app.use(express.json());
 
-// Memory-te audio file save korar jonno multer setup
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+// Google Gemini Setup - Using Gemini 2.5 Flash for Native Audio
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Tor requested preview model
+const model = genAI.getGenerativeModel({ 
+    model: "gemini-2.5-flash-native-audio-preview-12-2025" 
+});
 
-// API endpoint jekhane frontend audio pathabe
+const upload = multer({ storage: multer.memoryStorage() });
+
+// n8n Production Webhook URL (Ensure POST method in n8n)
+const N8N_WEBHOOK_URL = 'https://n8n.solanacy.in/webhook/4d2aafc0-a01e-4a4a-b925-7638a3404ed0';
+
 app.post('/api/upload-audio', upload.single('audioFile'), async (req, res) => {
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'Kono audio file asheni' });
-        }
+        if (!req.file) return res.status(400).json({ error: 'No audio provided' });
 
-        const audioBuffer = req.file.buffer;
-        console.log('Audio received! Size:', audioBuffer.length, 'bytes');
+        // Native Audio Input Preparation
+        const audioPart = {
+            inlineData: {
+                data: req.file.buffer.toString("base64"),
+                mimeType: req.file.mimetype // Usually audio/webm or audio/ogg
+            }
+        };
 
-        // TODO: Ekhane amra pore audio take text-e convert korbo 
-        // ar apnar n8n Webhook-e request pathabo.
+        // Model theke direct output neowa
+        const result = await model.generateContent([
+            "Listen to this audio from Saumik and provide a direct text transcription. If it's a command, just transcribe it.",
+            audioPart
+        ]);
+        
+        const transcribedText = result.response.text();
+        console.log('ARIA Heard:', transcribedText);
 
-        res.json({ success: true, message: 'Audio successfully received on server!' });
+        // n8n Webhook-e data pathano
+        const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
+            chatInput: transcribedText,
+            user: "Saumik Paul",
+            timestamp: new Date().toISOString()
+        });
+
+        // n8n theke response handle kora
+        const aiReply = n8nResponse.data.output || n8nResponse.data[0]?.output || "Processed by ARIA";
+
+        res.json({ 
+            success: true, 
+            message: aiReply,
+            transcription: transcribedText 
+        });
+
     } catch (error) {
-        console.error('Error processing audio:', error);
-        res.status(500).json({ error: 'Server error' });
+        console.error('v2v Processing Error:', error);
+        res.status(500).json({ error: 'Native audio processing failed' });
     }
 });
 
-// Render-er port ba default 3000
+app.get('/', (req, res) => res.send('Solanacy Agent Backend is Live (Gemini 2.5)'));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running with Gemini 2.5 on port ${PORT}`));
