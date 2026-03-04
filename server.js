@@ -16,10 +16,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || 'https://n8n.solanacy.in/webhook/4d2aafc0-a01e-4a4a-b925-7638a3404ed0';
 const MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 
-// Gemini Live API WebSocket URL
 const GEMINI_WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
-// System instruction for ARIA
 const SYSTEM_INSTRUCTION = `You are Saumik's highly intelligent and proactive personal AI assistant. Your name is ARIA (Advanced Responsive Intelligent Assistant).
 
 PERSONALITY:
@@ -40,16 +38,16 @@ STRICT RULES:
 - Ask for confirmation before sending emails or creating events
 - Protect Saumik's privacy at all times`;
 
-// Health check
+// ── Health check ──
 app.get('/', (req, res) => {
-    res.json({ 
-        status: 'ARIA Backend Live', 
+    res.json({
+        status: 'ARIA Backend Live',
         model: MODEL,
-        websocket: 'ws://your-render-url/voice'
+        websocket: 'wss://solanacy-agent-backend.onrender.com'
     });
 });
 
-// n8n action trigger (text commands)
+// ── n8n action trigger (text commands from website) ──
 app.post('/api/action', async (req, res) => {
     try {
         const { message } = req.body;
@@ -66,22 +64,36 @@ app.post('/api/action', async (req, res) => {
     }
 });
 
-// WebSocket connection handler
-wss.on('connection', (clientWs, req) => {
-    console.log('Client connected to ARIA Voice');
+// ── WebSocket connection handler ──
+wss.on('connection', (clientWs) => {
+    console.log('✅ Client connected');
 
     let geminiWs = null;
     let isGeminiReady = false;
     const messageQueue = [];
 
-    // Connect to Gemini Live API
+    // FIX ②: Transcript buffer — collect chunks, send after turnComplete
+    let transcriptBuffer = '';
+    let transcriptFlushTimer = null;
+
+    function flushTranscript() {
+        clearTimeout(transcriptFlushTimer);
+        if (transcriptBuffer.trim() && clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({
+                type: 'transcript',
+                text: transcriptBuffer.trim()
+            }));
+        }
+        transcriptBuffer = '';
+    }
+
     function connectToGemini() {
         geminiWs = new WebSocket(GEMINI_WS_URL);
 
         geminiWs.on('open', () => {
-            console.log('Connected to Gemini Live API');
+            console.log('🤖 Connected to Gemini Live API');
 
-            // Send setup message
+            // FIX ①: Added output_audio_transcription so text comes correctly
             const setupMessage = {
                 setup: {
                     model: `models/${MODEL}`,
@@ -90,10 +102,11 @@ wss.on('connection', (clientWs, req) => {
                         speech_config: {
                             voice_config: {
                                 prebuilt_voice_config: {
-                                    voice_name: 'Aoede' // Natural voice
+                                    voice_name: 'Aoede'
                                 }
                             }
-                        }
+                        },
+                        output_audio_transcription: {}
                     },
                     system_instruction: {
                         parts: [{ text: SYSTEM_INSTRUCTION }]
@@ -110,25 +123,24 @@ wss.on('connection', (clientWs, req) => {
 
                 // Setup complete
                 if (message.setupComplete) {
-                    console.log('Gemini session ready');
+                    console.log('✅ Gemini session ready');
                     isGeminiReady = true;
 
-                    // Send queued messages
                     while (messageQueue.length > 0) {
                         geminiWs.send(JSON.stringify(messageQueue.shift()));
                     }
 
-                    // Notify client
                     if (clientWs.readyState === WebSocket.OPEN) {
                         clientWs.send(JSON.stringify({ type: 'ready' }));
                     }
                 }
 
-                // Audio response from Gemini
+                // Audio + transcript from Gemini
                 if (message.serverContent?.modelTurn?.parts) {
                     for (const part of message.serverContent.modelTurn.parts) {
+
+                        // Audio chunk → send immediately
                         if (part.inlineData?.data) {
-                            // Send audio back to client
                             if (clientWs.readyState === WebSocket.OPEN) {
                                 clientWs.send(JSON.stringify({
                                     type: 'audio',
@@ -137,39 +149,46 @@ wss.on('connection', (clientWs, req) => {
                                 }));
                             }
                         }
-                        // Text transcript
-                        if (part.text) {
-                            console.log('ARIA said:', part.text);
-                            if (clientWs.readyState === WebSocket.OPEN) {
-                                clientWs.send(JSON.stringify({
-                                    type: 'transcript',
-                                    text: part.text
-                                }));
-                            }
 
-                            // Check if n8n action needed
-                            checkForN8nAction(part.text);
+                        // FIX ②: Buffer text chunks instead of sending each one separately
+                        if (part.text) {
+                            transcriptBuffer += part.text;
+                            // Debounce — flush after 300ms of silence
+                            clearTimeout(transcriptFlushTimer);
+                            transcriptFlushTimer = setTimeout(flushTranscript, 300);
                         }
                     }
                 }
 
-                // Turn complete
+                // Output audio transcription (from output_audio_transcription config)
+                if (message.serverContent?.outputTranscription?.text) {
+                    transcriptBuffer += message.serverContent.outputTranscription.text;
+                    clearTimeout(transcriptFlushTimer);
+                    transcriptFlushTimer = setTimeout(flushTranscript, 300);
+                }
+
+                // Turn complete → flush buffer immediately
                 if (message.serverContent?.turnComplete) {
+                    flushTranscript(); // FIX ②: flush all buffered text now
                     if (clientWs.readyState === WebSocket.OPEN) {
                         clientWs.send(JSON.stringify({ type: 'turnComplete' }));
                     }
                 }
 
-                // Input transcript (what user said)
+                // Input transcript (what user said via voice)
                 if (message.serverContent?.inputTranscription?.text) {
                     const userText = message.serverContent.inputTranscription.text;
-                    console.log('Saumik said:', userText);
+                    console.log('🗣 Saumik said:', userText);
+
                     if (clientWs.readyState === WebSocket.OPEN) {
                         clientWs.send(JSON.stringify({
                             type: 'inputTranscript',
                             text: userText
                         }));
                     }
+
+                    // FIX ③: Only trigger n8n when USER says action keyword, not ARIA
+                    triggerN8nIfNeeded(userText, 'voice');
                 }
 
             } catch (e) {
@@ -178,46 +197,47 @@ wss.on('connection', (clientWs, req) => {
         });
 
         geminiWs.on('error', (error) => {
-            console.error('Gemini WebSocket error:', error.message);
+            console.error('❌ Gemini error:', error.message);
             if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: 'error', message: error.message }));
             }
         });
 
         geminiWs.on('close', () => {
-            console.log('Gemini connection closed');
+            console.log('🔌 Gemini connection closed');
             if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: 'disconnected' }));
             }
         });
     }
 
-    // Check if ARIA response needs n8n action
-    async function checkForN8nAction(text) {
-        const actionKeywords = ['email', 'calendar', 'reminder', 'drive', 'search', 'news'];
-        const needsAction = actionKeywords.some(k => text.toLowerCase().includes(k));
-        
+    // FIX ③: n8n only triggered by USER request, not ARIA response
+    async function triggerN8nIfNeeded(userText, source) {
+        const actionKeywords = ['email পাঠাও', 'mail পাঠাও', 'calendar', 'reminder', 'drive', 'schedule', 'সময় দাও'];
+        const needsAction = actionKeywords.some(k => userText.toLowerCase().includes(k));
+
         if (needsAction) {
             try {
                 await axios.post(N8N_WEBHOOK_URL, {
-                    chatInput: text,
+                    chatInput: userText,
                     user: 'Saumik Paul',
-                    source: 'voice',
+                    source: source,
                     timestamp: new Date().toISOString()
                 });
+                console.log('✅ n8n triggered for:', userText);
             } catch (e) {
-                console.error('n8n trigger failed:', e.message);
+                console.error('❌ n8n trigger failed:', e.message);
             }
         }
     }
 
-    // Handle messages from client (browser)
+    // Handle messages from browser
     clientWs.on('message', (data) => {
         try {
             const message = JSON.parse(data.toString());
 
             if (message.type === 'audio') {
-                // Audio from microphone → send to Gemini
+                // Mic audio → Gemini
                 const realtimeInput = {
                     realtimeInput: {
                         mediaChunks: [{
@@ -234,7 +254,7 @@ wss.on('connection', (clientWs, req) => {
                 }
 
             } else if (message.type === 'text') {
-                // Text message → send to Gemini
+                // Text message → Gemini + n8n
                 const textMessage = {
                     clientContent: {
                         turns: [{
@@ -251,9 +271,22 @@ wss.on('connection', (clientWs, req) => {
                     messageQueue.push(textMessage);
                 }
 
+                // FIX ③: trigger n8n from text too
+                triggerN8nIfNeeded(message.text, 'text');
+
             } else if (message.type === 'connect') {
-                // Start Gemini connection
                 connectToGemini();
+
+            } else if (message.type === 'audioStreamEnd') {
+                // FIX ④: Tell Gemini user stopped speaking
+                if (isGeminiReady && geminiWs?.readyState === WebSocket.OPEN) {
+                    geminiWs.send(JSON.stringify({
+                        realtimeInput: {
+                            audioStreamEnd: true
+                        }
+                    }));
+                    console.log('🎤 Audio stream ended');
+                }
             }
 
         } catch (e) {
@@ -262,7 +295,8 @@ wss.on('connection', (clientWs, req) => {
     });
 
     clientWs.on('close', () => {
-        console.log('Client disconnected');
+        console.log('🔌 Client disconnected');
+        clearTimeout(transcriptFlushTimer);
         if (geminiWs) geminiWs.close();
     });
 
@@ -273,7 +307,6 @@ wss.on('connection', (clientWs, req) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`ARIA Backend running on port ${PORT}`);
-    console.log(`WebSocket: ws://localhost:${PORT}`);
-    console.log(`Model: ${MODEL}`);
+    console.log(`🚀 ARIA Backend running on port ${PORT}`);
+    console.log(`📡 Model: ${MODEL}`);
 });
