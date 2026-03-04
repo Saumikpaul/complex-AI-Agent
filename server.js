@@ -47,7 +47,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// ── n8n action trigger (text commands from website) ──
+// ── n8n action trigger ──
 app.post('/api/action', async (req, res) => {
     try {
         const { message } = req.body;
@@ -72,7 +72,7 @@ wss.on('connection', (clientWs) => {
     let isGeminiReady = false;
     const messageQueue = [];
 
-    // FIX ②: Transcript buffer — collect chunks, send after turnComplete
+    // Transcript buffer — collect chunks, send all at once on turnComplete
     let transcriptBuffer = '';
     let transcriptFlushTimer = null;
 
@@ -93,7 +93,6 @@ wss.on('connection', (clientWs) => {
         geminiWs.on('open', () => {
             console.log('🤖 Connected to Gemini Live API');
 
-            // FIX ①: Added output_audio_transcription so text comes correctly
             const setupMessage = {
                 setup: {
                     model: `models/${MODEL}`,
@@ -105,8 +104,7 @@ wss.on('connection', (clientWs) => {
                                     voice_name: 'Aoede'
                                 }
                             }
-                        },
-                        output_audio_transcription: {}
+                        }
                     },
                     system_instruction: {
                         parts: [{ text: SYSTEM_INSTRUCTION }]
@@ -139,7 +137,7 @@ wss.on('connection', (clientWs) => {
                 if (message.serverContent?.modelTurn?.parts) {
                     for (const part of message.serverContent.modelTurn.parts) {
 
-                        // Audio chunk → send immediately
+                        // Audio chunk → send immediately for smooth playback
                         if (part.inlineData?.data) {
                             if (clientWs.readyState === WebSocket.OPEN) {
                                 clientWs.send(JSON.stringify({
@@ -150,26 +148,18 @@ wss.on('connection', (clientWs) => {
                             }
                         }
 
-                        // FIX ②: Buffer text chunks instead of sending each one separately
+                        // Buffer text — don't send each chunk separately
                         if (part.text) {
                             transcriptBuffer += part.text;
-                            // Debounce — flush after 300ms of silence
                             clearTimeout(transcriptFlushTimer);
-                            transcriptFlushTimer = setTimeout(flushTranscript, 300);
+                            transcriptFlushTimer = setTimeout(flushTranscript, 400);
                         }
                     }
                 }
 
-                // Output audio transcription (from output_audio_transcription config)
-                if (message.serverContent?.outputTranscription?.text) {
-                    transcriptBuffer += message.serverContent.outputTranscription.text;
-                    clearTimeout(transcriptFlushTimer);
-                    transcriptFlushTimer = setTimeout(flushTranscript, 300);
-                }
-
-                // Turn complete → flush buffer immediately
+                // Turn complete → flush all buffered text at once
                 if (message.serverContent?.turnComplete) {
-                    flushTranscript(); // FIX ②: flush all buffered text now
+                    flushTranscript();
                     if (clientWs.readyState === WebSocket.OPEN) {
                         clientWs.send(JSON.stringify({ type: 'turnComplete' }));
                     }
@@ -187,7 +177,7 @@ wss.on('connection', (clientWs) => {
                         }));
                     }
 
-                    // FIX ③: Only trigger n8n when USER says action keyword, not ARIA
+                    // Only trigger n8n when USER says action keyword
                     triggerN8nIfNeeded(userText, 'voice');
                 }
 
@@ -203,17 +193,17 @@ wss.on('connection', (clientWs) => {
             }
         });
 
-        geminiWs.on('close', () => {
-            console.log('🔌 Gemini connection closed');
+        geminiWs.on('close', (code, reason) => {
+            console.log(`🔌 Gemini closed — code: ${code}, reason: ${reason?.toString()}`);
             if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: 'disconnected' }));
             }
         });
     }
 
-    // FIX ③: n8n only triggered by USER request, not ARIA response
+    // n8n only triggered by USER request keywords
     async function triggerN8nIfNeeded(userText, source) {
-        const actionKeywords = ['email পাঠাও', 'mail পাঠাও', 'calendar', 'reminder', 'drive', 'schedule', 'সময় দাও'];
+        const actionKeywords = ['email', 'mail', 'calendar', 'reminder', 'drive', 'schedule', 'news'];
         const needsAction = actionKeywords.some(k => userText.toLowerCase().includes(k));
 
         if (needsAction) {
@@ -224,7 +214,7 @@ wss.on('connection', (clientWs) => {
                     source: source,
                     timestamp: new Date().toISOString()
                 });
-                console.log('✅ n8n triggered for:', userText);
+                console.log('✅ n8n triggered for:', userText.substring(0, 50));
             } catch (e) {
                 console.error('❌ n8n trigger failed:', e.message);
             }
@@ -237,7 +227,6 @@ wss.on('connection', (clientWs) => {
             const message = JSON.parse(data.toString());
 
             if (message.type === 'audio') {
-                // Mic audio → Gemini
                 const realtimeInput = {
                     realtimeInput: {
                         mediaChunks: [{
@@ -254,7 +243,6 @@ wss.on('connection', (clientWs) => {
                 }
 
             } else if (message.type === 'text') {
-                // Text message → Gemini + n8n
                 const textMessage = {
                     clientContent: {
                         turns: [{
@@ -271,14 +259,14 @@ wss.on('connection', (clientWs) => {
                     messageQueue.push(textMessage);
                 }
 
-                // FIX ③: trigger n8n from text too
+                // Trigger n8n from text messages too
                 triggerN8nIfNeeded(message.text, 'text');
 
             } else if (message.type === 'connect') {
                 connectToGemini();
 
             } else if (message.type === 'audioStreamEnd') {
-                // FIX ④: Tell Gemini user stopped speaking
+                // Tell Gemini user stopped speaking
                 if (isGeminiReady && geminiWs?.readyState === WebSocket.OPEN) {
                     geminiWs.send(JSON.stringify({
                         realtimeInput: {
@@ -305,7 +293,7 @@ wss.on('connection', (clientWs) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
     console.log(`🚀 ARIA Backend running on port ${PORT}`);
     console.log(`📡 Model: ${MODEL}`);
